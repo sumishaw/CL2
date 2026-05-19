@@ -68,22 +68,25 @@ class SpeechCaptureService : Service() {
         private const val WHISPER_URL    = "http://127.0.0.1:8765/transcribe"
         private const val WHISPER_HEALTH = "http://127.0.0.1:8765/health"
 
-        // 4s chunks — small model processes in ~8-10s on Dimensity 7050 (4 threads).
-        // 4s chunks give more sentence context than 3s → better translation quality.
-        // Queue depth stays at 2-3 max, lag stays under ~20s.
-        private const val CHUNK_SECS    = 4.0
-        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()  // 64 000
-        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                   // 128 000
+        // 2s chunks — Whisper small processes 2s audio in ~5-6s (vs ~10s for 4s).
+        // Processing time scales with audio length, so halving chunk size
+        // nearly halves Whisper time. Total lag: 2s + 5s + 0.5s = ~7.5s
+        // vs previous 4s + 10s + 0.5s = ~14.5s. Nearly 2× faster.
+        // Trade-off: slightly less sentence context per chunk, but small model
+        // handles short chunks well due to its larger vocabulary.
+        private const val CHUNK_SECS    = 2.0
+        private const val CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_SECS).toInt()  // 32 000
+        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2                   // 64 000
 
-        private const val QUEUE_CAPACITY = 3
+        private const val QUEUE_CAPACITY = 4
 
-        // small model: ~10s Whisper + ~0.6s CT2 (two attempts) + 21s margin = 32s
-        private const val STALE_MS           = 32_000L
+        // small model with 2s chunks: ~5s Whisper + ~0.5s CT2 + 10s margin = 16s
+        private const val STALE_MS           = 16_000L
         private const val CONNECT_TIMEOUT_MS = 2_000
-        private const val READ_TIMEOUT_MS    = 32_000
+        private const val READ_TIMEOUT_MS    = 16_000
 
         private const val MAX_CONSECUTIVE_ERRORS = 5
-        private const val WATCHDOG_TIMEOUT_MS    = 45_000L
+        private const val WATCHDOG_TIMEOUT_MS    = 25_000L
         private const val MAX_BACKOFF_MS         = 8_000L
     }
 
