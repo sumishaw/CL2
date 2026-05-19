@@ -79,11 +79,12 @@ class SpeechCaptureService : Service() {
         // Queue capacity 4 = 12s of audio buffered max (4 × 3s chunks)
         private const val QUEUE_CAPACITY = 4
 
-        // Stale threshold: 3s chunk + 2s Whisper + 1s translate + 6s margin
-        private const val STALE_MS           = 12_000L
+        // Stale threshold: 3s chunk + 2.5s Whisper translate + 1s LibreTranslate + 8.5s margin
+        private const val STALE_MS           = 15_000L
         private const val CONNECT_TIMEOUT_MS = 2_000
-        // Read timeout: Whisper 3s chunk ~2s + LibreTranslate ~0.8s + 7s margin
-        private const val READ_TIMEOUT_MS    = 10_000
+        // Read timeout: Whisper translate ~2.5s + LibreTranslate en→hi ~1s + 11.5s margin = 15s
+        // Previous: 10s was causing disconnects because ja→en + en→hi two calls = up to 12s
+        private const val READ_TIMEOUT_MS    = 15_000
 
         private const val MAX_CONSECUTIVE_ERRORS = 5
         private const val WATCHDOG_TIMEOUT_MS    = 25_000L
