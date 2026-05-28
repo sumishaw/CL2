@@ -67,7 +67,7 @@ class SpeechCaptureService : Service() {
         // Server done_event.wait = 18s — client READ_TIMEOUT must be larger
         private const val STALE_MS           = 25_000L
         private const val CONNECT_TIMEOUT_MS = 2_000
-        private const val READ_TIMEOUT_MS    = 22_000
+        private const val READ_TIMEOUT_MS    = 25_000  // small model: up to ~10s + margin
 
         private const val MAX_CONSECUTIVE_ERRORS = 6
         private const val WATCHDOG_TIMEOUT_MS    = 60_000L  // 60s — long silences in videos are normal
