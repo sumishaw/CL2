@@ -9,7 +9,6 @@ void main() {
 
 class CaptionLensApp extends StatelessWidget {
   const CaptionLensApp({super.key});
-
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'Caption Lens',
@@ -22,11 +21,11 @@ class CaptionLensApp extends StatelessWidget {
       );
 }
 
-enum ModelState { checking, notDownloaded, downloading, ready, reconnecting, error }
+enum ModelState { checking, notReady, ready, error }
+enum CaptionMode { liveCaptions, audioCapture }
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
-
   @override
   State<HomePage> createState() => _HomePageState();
 }
@@ -34,22 +33,25 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   static const _ch = MethodChannel('overlay_channel');
 
-  String originalText     = '';
-  String displayText      = 'Tap START → approve screen capture → play any video…';
-  bool   isRunning        = false;
-  bool   hasOverlay       = false;
-  String targetLang       = 'hindi';
-  String statusMsg        = '';
-  int    translationCount = 0;
-  bool   _micPulse        = false;
-  Timer? _pulseTimer;
+  // State
+  String  originalText     = '';
+  String  displayText      = '';
+  bool    isRunning        = false;
+  bool    hasOverlay       = false;
+  bool    hasAccessibility = false;
+  String  targetLang       = 'hindi';
+  String  statusMsg        = '';
+  int     translationCount = 0;
+  bool    _pulse           = false;
+  Timer?  _pulseTimer;
+  Timer?  _pollTimer;
+  String  _lastSeenHindi   = '';
 
-  Timer? _pollTimer;
-  String _lastSeenHindi = '';
+  ModelState  modelState    = ModelState.checking;
+  String      modelErrorMsg = '';
 
-  ModelState modelState   = ModelState.checking;
-  int downloadPercent     = 0;
-  String modelErrorMsg    = '';
+  // Live Captions mode is now the primary mode
+  CaptionMode captionMode = CaptionMode.liveCaptions;
 
   @override
   void initState() {
@@ -68,21 +70,15 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           );
           break;
         case 'onModelReady':
-          if (mounted) setState(() {
-            modelState      = ModelState.ready;
-            downloadPercent = 100;
-          });
+          if (mounted) setState(() => modelState = ModelState.ready);
           break;
         case 'onModelError':
-          final a = call.arguments as Map? ?? {};
-          final msg = a['message']?.toString() ?? 'Whisper server not reachable';
-          final isAutoReconnect = isRunning && msg.contains('Reconnecting');
-          if (mounted) setState(() {
-            modelState    = isAutoReconnect ? ModelState.reconnecting : ModelState.error;
-            modelErrorMsg = msg;
-          });
+          final a   = call.arguments as Map? ?? {};
+          final msg = a['message']?.toString() ?? 'CT2 translation server not reachable';
+          if (mounted) setState(() { modelState = ModelState.error; modelErrorMsg = msg; });
           break;
-        case 'onDownloadProgress':
+        case 'onLiveCaptionReaderConnected':
+          if (mounted) setState(() => hasAccessibility = true);
           break;
       }
     });
@@ -101,8 +97,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _checkPermissions() async {
     try {
-      final ok = await _ch.invokeMethod<bool>('hasOverlayPermission') ?? false;
-      if (mounted) setState(() => hasOverlay = ok);
+      final overlay = await _ch.invokeMethod<bool>('hasOverlayPermission') ?? false;
+      if (mounted) setState(() => hasOverlay = overlay);
     } catch (_) {}
   }
 
@@ -110,25 +106,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     try {
       if (mounted) setState(() => modelState = ModelState.checking);
       final ready = await _ch.invokeMethod<bool>('isModelReady') ?? false;
-      if (mounted) setState(() => modelState = ready ? ModelState.ready : ModelState.notDownloaded);
+      if (mounted) setState(() => modelState = ready ? ModelState.ready : ModelState.notReady);
     } catch (_) {
-      if (mounted) setState(() => modelState = ModelState.notDownloaded);
-    }
-  }
-
-  Future<void> _startDownload() async {
-    try {
-      setState(() {
-        modelState      = ModelState.downloading;
-        downloadPercent = 0;
-        modelErrorMsg   = '';
-      });
-      await _ch.invokeMethod('startModelDownload');
-    } catch (e) {
-      setState(() {
-        modelState    = ModelState.error;
-        modelErrorMsg = e.toString();
-      });
+      if (mounted) setState(() => modelState = ModelState.notReady);
     }
   }
 
@@ -146,61 +126,55 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void _startPolling() {
     _pollTimer?.cancel();
-    // 200 ms poll — subtitle appears within 200 ms of result being ready
     _pollTimer = Timer.periodic(const Duration(milliseconds: 200), (_) async {
       if (!isRunning || !mounted) return;
       try {
         final result = await _ch.invokeMethod<Map>('getLatestTranslation');
         if (result == null || !mounted) return;
-        final orig = result['original']?.toString() ?? '';
-        final en   = result['english']?.toString()  ?? '';
-        final hi   = result['hindi']?.toString()    ?? '';
-        _applyTranslation(orig, en, hi);
+        _applyTranslation(
+          result['original']?.toString() ?? '',
+          result['english']?.toString()  ?? '',
+          result['hindi']?.toString()    ?? '',
+        );
       } catch (_) {}
     });
   }
 
-  void _stopPolling() {
-    _pollTimer?.cancel();
-    _pollTimer = null;
-  }
-
-  Future<void> _setLanguage(String lang) async {
-    await _ch.invokeMethod('setTargetLanguage', {'language': lang});
-    if (mounted) setState(() {
-      targetLang  = lang;
-      displayText = isRunning
-          ? 'Listening…'
-          : 'Tap START → approve screen capture → play any video…';
-    });
-  }
+  void _stopPolling() { _pollTimer?.cancel(); _pollTimer = null; }
 
   Future<void> _start() async {
     if (modelState != ModelState.ready) {
-      setState(() => statusMsg = '⚠️ Start whisper_server.py first, then tap CHECK');
+      setState(() => statusMsg = '⚠ Start whisper_server.py in Termux first, then tap CHECK');
       return;
     }
     if (!hasOverlay) {
       await _ch.invokeMethod('requestOverlayPermission');
       if (mounted) setState(() =>
-          statusMsg = '⚠️ Allow "Display over other apps" → come back → tap START');
+          statusMsg = '⚠ Allow "Display over other apps" → come back → tap START');
+      return;
+    }
+
+    if (captionMode == CaptionMode.liveCaptions && !hasAccessibility) {
+      if (mounted) setState(() =>
+          statusMsg = '⚠ Enable LiveCaptionReader in Settings → Accessibility → Caption Lens');
       return;
     }
 
     await _ch.invokeMethod('startOverlay');
-    if (mounted) setState(() => statusMsg = '⏳ Approve "Start recording" in system dialog…');
 
-    final ok = await _ch.invokeMethod<bool>('startSpeechCapture') ?? false;
-    if (!ok) {
-      if (mounted) setState(() =>
-          statusMsg = '⚠️ Screen capture not approved — tap START and allow the prompt');
-      return;
+    if (captionMode == CaptionMode.audioCapture) {
+      // Legacy audio capture mode
+      if (mounted) setState(() => statusMsg = '⏳ Approve "Start recording" dialog…');
+      final ok = await _ch.invokeMethod<bool>('startSpeechCapture') ?? false;
+      if (!ok) {
+        if (mounted) setState(() => statusMsg = '⚠ Screen capture not approved');
+        return;
+      }
     }
 
     _pulseTimer?.cancel();
-    _pulseTimer = Timer.periodic(const Duration(milliseconds: 700), (_) {
-      if (mounted) setState(() => _micPulse = !_micPulse);
-    });
+    _pulseTimer = Timer.periodic(const Duration(milliseconds: 700),
+        (_) { if (mounted) setState(() => _pulse = !_pulse); });
 
     _lastSeenHindi = '';
     _startPolling();
@@ -209,24 +183,33 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       isRunning        = true;
       translationCount = 0;
       statusMsg        = '';
-      displayText      = 'Listening to video audio…';
+      displayText      = captionMode == CaptionMode.liveCaptions
+          ? 'Reading Live Captions…'
+          : 'Listening to video audio…';
       originalText     = '';
     });
   }
 
   Future<void> _stop() async {
     _pulseTimer?.cancel();
-    _micPulse = false;
+    _pulse = false;
     _stopPolling();
-    await _ch.invokeMethod('stopSpeechCapture');
+    if (captionMode == CaptionMode.audioCapture) {
+      await _ch.invokeMethod('stopSpeechCapture');
+    }
     await _ch.invokeMethod('stopOverlay');
     if (mounted) setState(() {
-      isRunning    = false;
-      statusMsg    = '';
-      displayText  = 'Tap START → approve screen capture → play any video…';
-      originalText = '';
+      isRunning      = false;
+      statusMsg      = '';
+      displayText    = '';
+      originalText   = '';
       _lastSeenHindi = '';
     });
+  }
+
+  Future<void> _setLanguage(String lang) async {
+    await _ch.invokeMethod('setTargetLanguage', {'language': lang});
+    if (mounted) setState(() => targetLang = lang);
   }
 
   @override
@@ -236,6 +219,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
+
+  // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -252,18 +237,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               _buildInfoBanner(),
               const SizedBox(height: 16),
               _buildModelCard(),
-              const SizedBox(height: 16),
+              const SizedBox(height: 12),
               _buildOverlayPermRow(),
+              const SizedBox(height: 12),
+              _buildAccessibilityRow(),
+              const SizedBox(height: 16),
+              _buildModeSelector(),
               const SizedBox(height: 16),
               _buildLanguageChips(),
               const SizedBox(height: 16),
               _buildLangSelector(),
               const SizedBox(height: 16),
-              if (originalText.isNotEmpty && originalText != displayText) ...[
-                _buildDetectedAudio(),
+              if (originalText.isNotEmpty) ...[
+                _buildDetectedText(),
                 const SizedBox(height: 10),
               ],
-              _buildTranslationOutput(),
+              if (displayText.isNotEmpty)
+                _buildTranslationOutput(),
               if (statusMsg.isNotEmpty) ...[
                 const SizedBox(height: 12),
                 _buildStatusBanner(),
@@ -271,10 +261,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               const SizedBox(height: 20),
               _buildStartStopButton(),
               const SizedBox(height: 8),
-              const Center(
+              Center(
                 child: Text(
-                  'Captures internal phone audio — microphone stays off',
-                  style: TextStyle(color: Colors.white24, fontSize: 11),
+                  captionMode == CaptionMode.liveCaptions
+                      ? 'Using Android Live Captions — no audio captured by this app'
+                      : 'Captures internal phone audio — microphone stays off',
+                  style: const TextStyle(color: Colors.white24, fontSize: 11),
+                  textAlign: TextAlign.center,
                 ),
               ),
               const SizedBox(height: 20),
@@ -285,182 +278,114 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildHeader() {
-    return Row(children: [
-      AnimatedContainer(
-        duration: const Duration(milliseconds: 400),
-        width: 36,
-        height: 36,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: isRunning
-              ? (_micPulse ? Colors.red : Colors.red.withOpacity(0.5))
-              : Colors.white12,
-        ),
-        child: const Icon(Icons.subtitles, color: Colors.white, size: 20),
+  Widget _buildHeader() => Row(children: [
+    AnimatedContainer(
+      duration: const Duration(milliseconds: 400),
+      width: 36, height: 36,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: isRunning
+            ? (_pulse ? Colors.red : Colors.red.withOpacity(0.5))
+            : Colors.white12,
       ),
-      const SizedBox(width: 12),
-      const Expanded(
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Caption Lens',
-              style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold)),
-          Text('Translates internal video audio — no microphone used',
-              style: TextStyle(color: Colors.white38, fontSize: 11)),
+      child: const Icon(Icons.subtitles, color: Colors.white, size: 20),
+    ),
+    const SizedBox(width: 12),
+    const Expanded(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('Caption Lens',
+            style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.bold)),
+        Text('Real-time Hindi subtitles via Live Captions',
+            style: TextStyle(color: Colors.white38, fontSize: 11)),
+      ]),
+    ),
+    if (isRunning)
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(color: Colors.red, borderRadius: BorderRadius.circular(12)),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.fiber_manual_record, color: Colors.white, size: 8),
+          const SizedBox(width: 4),
+          Text('$translationCount',
+              style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
         ]),
       ),
-      if (isRunning)
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-          decoration: BoxDecoration(
-              color: Colors.red, borderRadius: BorderRadius.circular(12)),
-          child: Row(mainAxisSize: MainAxisSize.min, children: [
-            const Icon(Icons.fiber_manual_record, color: Colors.white, size: 8),
-            const SizedBox(width: 4),
-            Text('$translationCount',
-                style: const TextStyle(
-                    color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
-          ]),
-        ),
-    ]);
-  }
+  ]);
 
-  Widget _buildInfoBanner() => Container(
-    padding: const EdgeInsets.all(12),
-    decoration: BoxDecoration(
-      color: Colors.blue.withOpacity(0.08),
-      borderRadius: BorderRadius.circular(10),
-      border: Border.all(color: Colors.blue.withOpacity(0.2)),
-    ),
-    child: const Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Icon(Icons.info_outline, color: Colors.blue, size: 16),
-      SizedBox(width: 8),
-      Expanded(
-        child: Text(
-          'Captures audio playing on the tablet internally — works with YouTube, VLC, '
-          'Chrome, offline videos. Microphone NOT used. Approve the screen capture '
-          'dialog when you tap START.',
-          style: TextStyle(color: Colors.white60, fontSize: 12, height: 1.5),
-        ),
+  Widget _buildInfoBanner() {
+    final isLC = captionMode == CaptionMode.liveCaptions;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.blue.withOpacity(0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.blue.withOpacity(0.2)),
       ),
-    ]),
-  );
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Icon(Icons.info_outline, color: Colors.blue, size: 16),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            isLC
+                ? 'Uses Android Live Captions for perfect speech recognition. '
+                  'Enable Live Captions + this accessibility service, then tap START.'
+                : 'Captures audio playing on the tablet internally — works with YouTube, VLC, '
+                  'Chrome, offline videos. Approve the screen capture dialog when you tap START.',
+            style: const TextStyle(color: Colors.white60, fontSize: 12, height: 1.5),
+          ),
+        ),
+      ]),
+    );
+  }
 
   Widget _buildModelCard() {
     switch (modelState) {
       case ModelState.checking:
         return _cardShell(
-          icon: Icons.hourglass_top,
-          iconColor: Colors.white38,
-          borderColor: Colors.white12,
-          bgColor: const Color(0xFF111111),
-          title: 'Checking Whisper server…',
+          icon: Icons.hourglass_top, iconColor: Colors.white38,
+          borderColor: Colors.white12, bgColor: const Color(0xFF111111),
+          title: 'Checking CT2 translation server…',
           subtitle: 'Connecting to whisper_server.py on port 8765',
-          trailing: const SizedBox(
-            width: 18, height: 18,
-            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white38),
-          ),
+          trailing: const SizedBox(width: 18, height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white38)),
         );
-
-      case ModelState.notDownloaded:
+      case ModelState.notReady:
         return _cardShell(
-          icon: Icons.cloud_off,
-          iconColor: Colors.orangeAccent,
+          icon: Icons.cloud_off, iconColor: Colors.orangeAccent,
           borderColor: Colors.orange.withOpacity(0.4),
           bgColor: Colors.orange.withOpacity(0.06),
-          title: 'Whisper Server Not Running',
-          subtitle: 'Start whisper_server.py on the tablet first.\npython3 whisper_server.py',
+          title: 'Translation Server Not Running',
+          subtitle: 'Run in Termux:\npython3 whisper_server.py',
           trailing: ElevatedButton(
-            onPressed: _startDownload,
+            onPressed: _checkModelStatus,
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.orangeAccent,
-              foregroundColor: Colors.black,
+              backgroundColor: Colors.orangeAccent, foregroundColor: Colors.black,
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
             ),
             child: const Text('CHECK', style: TextStyle(fontWeight: FontWeight.bold)),
           ),
         );
-
-      case ModelState.downloading:
-        return Container(
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: Colors.blue.withOpacity(0.07),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.blue.withOpacity(0.35)),
-          ),
-          child: const Row(children: [
-            SizedBox(
-              width: 20, height: 20,
-              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent),
-            ),
-            SizedBox(width: 14),
-            Expanded(
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('Checking Whisper Server…',
-                    style: TextStyle(color: Colors.white, fontSize: 13,
-                        fontWeight: FontWeight.w600)),
-                SizedBox(height: 4),
-                Text('Pinging http://127.0.0.1:8765/ready',
-                    style: TextStyle(color: Colors.white54, fontSize: 11)),
-              ]),
-            ),
-          ]),
-        );
-
-      case ModelState.reconnecting:
-        return Container(
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: Colors.orange.withOpacity(0.07),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: Colors.orange.withOpacity(0.35)),
-          ),
-          child: Row(children: [
-            const SizedBox(
-              width: 20, height: 20,
-              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange),
-            ),
-            const SizedBox(width: 14),
-            const Expanded(
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text('Reconnecting to Whisper…',
-                    style: TextStyle(color: Colors.white, fontSize: 13,
-                        fontWeight: FontWeight.w600)),
-                SizedBox(height: 4),
-                Text('Auto-reconnecting — subtitles will resume shortly',
-                    style: TextStyle(color: Colors.white54, fontSize: 11)),
-              ]),
-            ),
-          ]),
-        );
-
       case ModelState.ready:
         return _cardShell(
-          icon: Icons.check_circle,
-          iconColor: Colors.greenAccent,
+          icon: Icons.check_circle, iconColor: Colors.greenAccent,
           borderColor: Colors.greenAccent.withOpacity(0.3),
           bgColor: Colors.green.withOpacity(0.06),
-          title: 'Speech Model Ready',
-          subtitle: 'faster-whisper · Hindi output · No censoring',
+          title: 'Translation Server Ready',
+          subtitle: 'CT2 opus-mt-en-hi · Hindi output · No censoring',
           trailing: const Icon(Icons.check, color: Colors.greenAccent, size: 20),
         );
-
       case ModelState.error:
         return _cardShell(
-          icon: Icons.error_outline,
-          iconColor: Colors.redAccent,
+          icon: Icons.error_outline, iconColor: Colors.redAccent,
           borderColor: Colors.red.withOpacity(0.4),
           bgColor: Colors.red.withOpacity(0.06),
-          title: 'Whisper Server Unreachable',
-          subtitle: modelErrorMsg.isNotEmpty
-              ? modelErrorMsg
-              : 'Start whisper_server.py then tap RETRY',
+          title: 'Translation Server Unreachable',
+          subtitle: modelErrorMsg.isNotEmpty ? modelErrorMsg : 'Start whisper_server.py then tap RETRY',
           trailing: ElevatedButton(
-            onPressed: _startDownload,
+            onPressed: _checkModelStatus,
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.redAccent,
-              foregroundColor: Colors.white,
+              backgroundColor: Colors.redAccent, foregroundColor: Colors.white,
               padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
             ),
@@ -470,81 +395,126 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  Widget _cardShell({
+  Widget _buildOverlayPermRow() => _permRow(
+    icon: hasOverlay ? Icons.check_circle : Icons.radio_button_unchecked,
+    iconColor: hasOverlay ? Colors.greenAccent : Colors.white30,
+    title: 'Overlay Permission',
+    subtitle: 'Required to show floating subtitles over other apps',
+    granted: hasOverlay,
+    onAllow: () async {
+      await _ch.invokeMethod('requestOverlayPermission');
+      await _checkPermissions();
+    },
+  );
+
+  Widget _buildAccessibilityRow() => _permRow(
+    icon: hasAccessibility ? Icons.check_circle : Icons.accessibility_new,
+    iconColor: hasAccessibility ? Colors.greenAccent : Colors.white30,
+    title: 'Accessibility Service',
+    subtitle: hasAccessibility
+        ? 'LiveCaptionReader active — reading Live Captions'
+        : 'Settings → Accessibility → Caption Lens → LiveCaptionReader → ON',
+    granted: hasAccessibility,
+    onAllow: () async {
+      await _ch.invokeMethod('openAccessibilitySettings');
+    },
+    allowLabel: 'Enable',
+  );
+
+  Widget _permRow({
     required IconData icon,
     required Color iconColor,
-    required Color borderColor,
-    required Color bgColor,
     required String title,
     required String subtitle,
-    Widget? trailing,
-  }) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-      decoration: BoxDecoration(
-        color: bgColor,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: borderColor),
-      ),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-        Icon(icon, color: iconColor, size: 22),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(title,
-                style: const TextStyle(
-                    color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 3),
-            Text(subtitle,
-                style: const TextStyle(color: Colors.white54, fontSize: 11, height: 1.4)),
-          ]),
-        ),
-        if (trailing != null) ...[const SizedBox(width: 10), trailing],
-      ]),
-    );
-  }
-
-  Widget _buildOverlayPermRow() => Container(
+    required bool granted,
+    required VoidCallback onAllow,
+    String allowLabel = 'Allow',
+  }) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
     decoration: BoxDecoration(
       color: const Color(0xFF111111),
       borderRadius: BorderRadius.circular(10),
-      border: Border.all(
-          color: hasOverlay ? Colors.greenAccent.withOpacity(0.3) : Colors.white12),
+      border: Border.all(color: granted ? Colors.greenAccent.withOpacity(0.3) : Colors.white12),
     ),
     child: Row(children: [
-      Icon(
-        hasOverlay ? Icons.check_circle : Icons.radio_button_unchecked,
-        color: hasOverlay ? Colors.greenAccent : Colors.white30,
-        size: 20,
-      ),
+      Icon(icon, color: iconColor, size: 20),
       const SizedBox(width: 10),
-      const Expanded(
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Overlay Permission',
-              style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500)),
-          Text('Required to show floating subtitles over other apps',
-              style: TextStyle(color: Colors.white38, fontSize: 11)),
-        ]),
-      ),
-      if (!hasOverlay)
+      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(title, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500)),
+        Text(subtitle, style: const TextStyle(color: Colors.white38, fontSize: 11, height: 1.4)),
+      ])),
+      if (!granted)
         GestureDetector(
-          onTap: () async {
-            await _ch.invokeMethod('requestOverlayPermission');
-            await _checkPermissions();
-          },
+          onTap: onAllow,
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            decoration: BoxDecoration(
-                color: const Color(0xFFFF3B3B), borderRadius: BorderRadius.circular(6)),
-            child: const Text('Allow',
-                style: TextStyle(
-                    color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+            decoration: BoxDecoration(color: const Color(0xFFFF3B3B), borderRadius: BorderRadius.circular(6)),
+            child: Text(allowLabel,
+                style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
           ),
         ),
-      if (hasOverlay) const Icon(Icons.check, color: Colors.greenAccent, size: 16),
+      if (granted) const Icon(Icons.check, color: Colors.greenAccent, size: 16),
     ]),
   );
+
+  Widget _buildModeSelector() => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const Text('Caption Source',
+          style: TextStyle(color: Colors.white54, fontSize: 12, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8),
+      Row(children: [
+        _modeBtn(
+          icon: Icons.closed_caption,
+          label: 'Live Captions',
+          sublabel: 'Recommended',
+          mode: CaptionMode.liveCaptions,
+        ),
+        const SizedBox(width: 10),
+        _modeBtn(
+          icon: Icons.mic_none,
+          label: 'Audio Capture',
+          sublabel: 'Legacy',
+          mode: CaptionMode.audioCapture,
+        ),
+      ]),
+    ],
+  );
+
+  Widget _modeBtn({
+    required IconData icon,
+    required String label,
+    required String sublabel,
+    required CaptionMode mode,
+  }) {
+    final sel = captionMode == mode;
+    return Expanded(
+      child: GestureDetector(
+        onTap: isRunning ? null : () => setState(() => captionMode = mode),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 10),
+          decoration: BoxDecoration(
+            color: sel ? const Color(0xFFFF3B3B).withOpacity(0.15) : const Color(0xFF1E1E1E),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: sel ? const Color(0xFFFF3B3B) : Colors.white12),
+          ),
+          child: Column(children: [
+            Icon(icon, color: sel ? const Color(0xFFFF3B3B) : Colors.white38, size: 22),
+            const SizedBox(height: 4),
+            Text(label, style: TextStyle(
+              color: sel ? Colors.white : Colors.white54,
+              fontSize: 12, fontWeight: sel ? FontWeight.bold : FontWeight.normal,
+            )),
+            Text(sublabel, style: TextStyle(
+              color: sel ? Colors.redAccent.withOpacity(0.7) : Colors.white24,
+              fontSize: 10,
+            )),
+          ]),
+        ),
+      ),
+    );
+  }
 
   Widget _buildLanguageChips() => Container(
     padding: const EdgeInsets.all(14),
@@ -555,8 +525,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ),
     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const Text('Detects & Translates',
-          style: TextStyle(
-              color: Colors.white54, fontSize: 12, fontWeight: FontWeight.bold)),
+          style: TextStyle(color: Colors.white54, fontSize: 12, fontWeight: FontWeight.bold)),
       const SizedBox(height: 10),
       Wrap(spacing: 8, runSpacing: 8, children: [
         _chip('🇯🇵 Japanese'), _chip('🇨🇳 Chinese'),    _chip('🇰🇷 Korean'),
@@ -566,8 +535,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ]),
       const SizedBox(height: 10),
       const Text('Works with',
-          style: TextStyle(
-              color: Colors.white54, fontSize: 12, fontWeight: FontWeight.bold)),
+          style: TextStyle(color: Colors.white54, fontSize: 12, fontWeight: FontWeight.bold)),
       const SizedBox(height: 8),
       Wrap(spacing: 8, runSpacing: 8, children: [
         _chip('📺 YouTube'), _chip('🌐 Chrome'), _chip('🦊 Firefox'),
@@ -580,8 +548,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
       const Text('Translate to',
-          style: TextStyle(
-              color: Colors.white54, fontSize: 12, fontWeight: FontWeight.bold)),
+          style: TextStyle(color: Colors.white54, fontSize: 12, fontWeight: FontWeight.bold)),
       const SizedBox(height: 8),
       Row(children: [
         _langBtn('🇬🇧 English', 'english'),
@@ -591,11 +558,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     ],
   );
 
-  Widget _buildDetectedAudio() => Column(
+  Widget _buildDetectedText() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
-      const Text('Detected audio',
-          style: TextStyle(color: Colors.white38, fontSize: 12)),
+      Text(
+        captionMode == CaptionMode.liveCaptions ? 'Live Caption' : 'Detected audio',
+        style: const TextStyle(color: Colors.white38, fontSize: 12),
+      ),
       const SizedBox(height: 6),
       Container(
         width: double.infinity,
@@ -613,12 +582,11 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     children: [
       Text(
         targetLang == 'hindi' ? '🇮🇳 Hindi Translation' : '🇬🇧 English Translation',
-        style: const TextStyle(
-            color: Colors.greenAccent, fontSize: 12, fontWeight: FontWeight.bold),
+        style: const TextStyle(color: Colors.greenAccent, fontSize: 12, fontWeight: FontWeight.bold),
       ),
       const SizedBox(height: 6),
       AnimatedSwitcher(
-        duration: const Duration(milliseconds: 80), // fast subtitle flip
+        duration: const Duration(milliseconds: 80),
         child: Container(
           key: ValueKey(displayText),
           width: double.infinity,
@@ -630,10 +598,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           ),
           child: Text(displayText,
               style: const TextStyle(
-                  color: Colors.greenAccent,
-                  fontSize: 22,
-                  fontWeight: FontWeight.bold,
-                  height: 1.4)),
+                  color: Colors.greenAccent, fontSize: 22,
+                  fontWeight: FontWeight.bold, height: 1.4)),
         ),
       ),
     ],
@@ -649,29 +615,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     child: Row(children: [
       const Icon(Icons.info_outline, color: Colors.orange, size: 16),
       const SizedBox(width: 8),
-      Expanded(
-        child: Text(statusMsg,
-            style: const TextStyle(color: Colors.orange, fontSize: 13)),
-      ),
+      Expanded(child: Text(statusMsg,
+          style: const TextStyle(color: Colors.orange, fontSize: 13))),
     ]),
   );
 
   Widget _buildStartStopButton() {
-    final busy = modelState == ModelState.downloading ||
-        modelState == ModelState.checking ||
-        modelState == ModelState.reconnecting;
+    final busy = modelState == ModelState.checking;
+    final readyToStart = modelState == ModelState.ready && hasOverlay &&
+        (captionMode == CaptionMode.audioCapture || hasAccessibility);
+
     return SizedBox(
       width: double.infinity,
       child: ElevatedButton.icon(
-        onPressed: busy ? null : (isRunning ? _stop : _start),
+        onPressed: busy ? null : (isRunning ? _stop : (readyToStart ? _start : _start)),
         icon: Icon(
           isRunning ? Icons.stop_circle_outlined : Icons.play_circle_outline,
           size: 26,
         ),
         label: Text(
-          isRunning ? 'STOP' : 'START — CAPTURE VIDEO AUDIO',
-          style: const TextStyle(
-              fontSize: 16, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+          isRunning ? 'STOP' : (captionMode == CaptionMode.liveCaptions
+              ? 'START — LIVE CAPTIONS MODE'
+              : 'START — CAPTURE VIDEO AUDIO'),
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, letterSpacing: 0.5),
         ),
         style: ElevatedButton.styleFrom(
           backgroundColor: isRunning ? const Color(0xFF333333) : const Color(0xFFFF3B3B),
@@ -706,18 +672,38 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         decoration: BoxDecoration(
           color: selected ? const Color(0xFFFF3B3B) : const Color(0xFF1E1E1E),
           borderRadius: BorderRadius.circular(24),
-          border: Border.all(
-              color: selected ? const Color(0xFFFF3B3B) : Colors.white12),
+          border: Border.all(color: selected ? const Color(0xFFFF3B3B) : Colors.white12),
         ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: selected ? Colors.white : Colors.white54,
-            fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-            fontSize: 14,
-          ),
-        ),
+        child: Text(label,
+            style: TextStyle(
+              color: selected ? Colors.white : Colors.white54,
+              fontWeight: selected ? FontWeight.bold : FontWeight.normal,
+              fontSize: 14,
+            )),
       ),
     );
   }
+
+  Widget _cardShell({
+    required IconData icon, required Color iconColor,
+    required Color borderColor, required Color bgColor,
+    required String title, required String subtitle, Widget? trailing,
+  }) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+    decoration: BoxDecoration(
+      color: bgColor,
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: borderColor),
+    ),
+    child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+      Icon(icon, color: iconColor, size: 22),
+      const SizedBox(width: 12),
+      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(title, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+        const SizedBox(height: 3),
+        Text(subtitle, style: const TextStyle(color: Colors.white54, fontSize: 11, height: 1.4)),
+      ])),
+      if (trailing != null) ...[const SizedBox(width: 10), trailing],
+    ]),
+  );
 }
