@@ -211,16 +211,19 @@ class LiveCaptionReader : AccessibilityService() {
     // ── Scheduling ────────────────────────────────────────────────────────────
 
     private fun scheduleTranslation(sendText: String) {
-        // Detect language script switch — reset dedup state so first line of
-        // new language is never blocked by state from the previous language
         val scriptNow = detectScript(sendText)
         if (scriptNow != lastDetectedLang && lastDetectedLang.isNotEmpty()) {
+            // Language switched — clear all dedup state immediately so the
+            // first line of the new language is never blocked by old-language state.
+            // Do NOT touch captionWasVisible — the window is still visible,
+            // only the language changed.
+            Log.i(TAG, "Language switch: $lastDetectedLang → $scriptNow — resetting state")
             lastSentText           = ""
             lastTranslatedSentence = ""
             lastHindiOut           = ""
             lastRawCaption         = ""
             lastSentText2          = ""
-            captionWasVisible      = false
+            translateQueue.clear()  // discard old-language backlog
         }
         lastDetectedLang = scriptNow
 
@@ -347,6 +350,9 @@ class LiveCaptionReader : AccessibilityService() {
             if (cp in 0x0400..0x04FF) return "ru"
             if (cp in 0x0900..0x097F) return "hi"
         }
-        return "latin"
+        // Distinguish Latin-EN from Latin-other using diacritics (é ñ ü ö ç à etc.)
+        // A single accented letter is a strong signal of non-English Latin
+        val hasAccent = text.any { it.isLetter() && !it.isLetter().and(it.code < 128) && it.code in 0x00C0..0x024F }
+        return if (hasAccent) "latin_foreign" else "latin_en"
     }
 }
