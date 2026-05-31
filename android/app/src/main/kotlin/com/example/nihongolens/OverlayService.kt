@@ -13,16 +13,15 @@ import android.widget.*
 import androidx.core.app.NotificationCompat
 
 /**
- * OverlayService — Clean 2-line subtitle display
+ * OverlayService — 2-line Hindi subtitle overlay
  *
- * Behaviour:
- *  - Shows up to 2 lines at a time
- *  - Line 1 (top):  previous translation — dimmed, smaller
- *  - Line 2 (bottom): current translation — bright, bold, pill background
- *  - When a 3rd line arrives → clear both, show new line alone at bottom
- *  - 5s silence → fade out and clear everything
- *
- * This matches how professional subtitles work — page-flip, not endless scroll.
+ * Display model:
+ *  - Each translation result = one display unit (never split into fragments)
+ *  - Unit shown across up to 2 wrapped lines of text
+ *  - Unit stays visible for READ_MS (3s) minimum so user can read it
+ *  - Next unit from FIFO queue shown after READ_MS
+ *  - If queue empty after READ_MS, current unit stays until SILENCE_MS (8s) then fades
+ *  - FIFO queue — never drops any translation
  */
 class OverlayService : Service() {
 
@@ -41,29 +40,28 @@ class OverlayService : Service() {
         }
     }
 
-    // Max lines before page-flip clear
-    private val MAX_LINES   = 2
-    // Clear everything after this silence
-    private val SILENCE_MS  = 8_000L
+    // Minimum time each translation unit stays visible (ms)
+    // Enough to read 2 lines of Hindi at comfortable pace
+    private val READ_MS      = 3_000L
+    // After last speech, fade overlay after this silence
+    private val SILENCE_MS   = 8_000L
 
-    // Internal display queue — translated Hindi sentences waiting to be shown.
-    // Filled by updateText(), drained one sentence at a time by the display loop.
-    // This is what makes FIFO work: each 2-line block stays on screen until
-    // the display loop pops the next sentence from this queue.
-    private val displayQueue = ArrayDeque<String>()
+    // FIFO queue of translation units (each = full Hindi result, not split)
+    private val displayQueue  = ArrayDeque<String>()
 
-    private var windowManager:  WindowManager?               = null
-    private var overlayView:    View?                        = null
-    private var linesContainer: LinearLayout?                = null
-    private var params:         WindowManager.LayoutParams?  = null
+    private var windowManager:  WindowManager?              = null
+    private var overlayView:    View?                       = null
+    private var textView:       TextView?                   = null
+    private var params:         WindowManager.LayoutParams? = null
     private val mainHandler     = Handler(Looper.getMainLooper())
 
     @Volatile private var running   = true
     @Volatile private var viewAdded = false
 
-    // Current lines: index 0 = older (top), index 1 = newer (bottom)
-    private val lines = mutableListOf<String>()
+    private var currentText      = ""
+    private var readRunnable:    Runnable? = null
     private var silenceRunnable: Runnable? = null
+    private var isShowing        = false
 
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
@@ -82,9 +80,7 @@ class OverlayService : Service() {
         }
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         mainHandler.post { if (running) buildOverlay() }
-        pushCallback = { original, hindi ->
-            mainHandler.post { onNewText(original, hindi) }
-        }
+        pushCallback = { _, hindi -> mainHandler.post { onNewText(hindi) } }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int) = START_STICKY
@@ -94,10 +90,9 @@ class OverlayService : Service() {
         running      = false
         pushCallback = null
         mainHandler.removeCallbacksAndMessages(null)
-        lines.clear()
         displayQueue.clear()
-        flipScheduled = false
-        cancelStaleLine()
+        currentText = ""
+        isShowing   = false
         if (viewAdded) {
             try { windowManager?.removeView(overlayView) } catch (_: Exception) {}
             viewAdded = false
@@ -107,182 +102,89 @@ class OverlayService : Service() {
 
     // ── Text update ───────────────────────────────────────────────────────────
 
-    private fun onNewText(original: String, hindi: String) {
+    private fun onNewText(hindi: String) {
         if (hindi.isBlank()) return
-        // No lastHindi dedup — every translation is always fresh, never cached
 
-        val incoming = splitHindi(hindi.trim())
-        for (sentence in incoming) {
-            if (sentence.isNotBlank()) displayQueue.addLast(sentence)
-        }
+        // Add to FIFO queue — never drop
+        displayQueue.addLast(hindi.trim())
 
-        advanceDisplay()
+        // If nothing showing, show immediately
+        if (!isShowing) showNext()
+
         rescheduleSilence()
     }
 
-    // MIN_LINE_MS: minimum time a 2-line block stays visible before page-flip.
-    // 2500ms gives enough time to read both lines comfortably.
-    // STALE_LINE_MS: if only 1 line is showing and nothing new arrives,
-    // clear it after this delay so it doesn't stick on screen forever.
-    private val MIN_LINE_MS   = 2_500L
-    private val STALE_LINE_MS = 5_000L
-    private var flipScheduled  = false
-    private var staleRunnable: Runnable? = null
-
-    private fun advanceDisplay() {
-        cancelStaleLine()
-
-        // Fill empty slots from queue immediately
-        while (lines.size < MAX_LINES && displayQueue.isNotEmpty()) {
-            lines.add(displayQueue.removeFirst())
-            renderLines(animate = true)
+    // Show the next item from the queue
+    private fun showNext() {
+        if (displayQueue.isEmpty()) {
+            // Nothing more — keep current text visible, wait for silence
+            return
         }
 
-        when {
-            // Block full AND more queued → schedule page-flip after MIN_LINE_MS
-            lines.size >= MAX_LINES && displayQueue.isNotEmpty() && !flipScheduled -> {
-                flipScheduled = true
-                mainHandler.postDelayed({
-                    flipScheduled = false
-                    if (!running) return@postDelayed
-                    clearWithFade {
-                        lines.clear()
-                        advanceDisplay()
-                    }
-                }, MIN_LINE_MS)
-            }
-
-            // Only 1 line showing and queue is empty → schedule stale clear
-            // so a lone subtitle doesn't stick on screen indefinitely
-            lines.size in 1 until MAX_LINES && displayQueue.isEmpty() -> {
-                scheduleStaleLineClear()
-            }
-
-            // Block full, nothing more queued → hold until new text arrives
-            // (handled by next call to advanceDisplay from onNewText)
+        val text = displayQueue.removeFirst()
+        if (text == currentText && displayQueue.isEmpty()) {
+            // Exact same text and nothing more — skip duplicate, stay on screen
+            return
         }
-    }
 
-    private fun scheduleStaleLineClear() {
-        staleRunnable = Runnable {
+        currentText = text
+        isShowing   = true
+        showText(text, animate = true)
+
+        // Schedule advancing to next item after READ_MS
+        readRunnable?.let { mainHandler.removeCallbacks(it) }
+        readRunnable = Runnable {
             if (!running) return@Runnable
-            if (displayQueue.isEmpty()) {
-                // Nothing arrived — clear the stale line
-                clearWithFade { lines.clear() }
-            } else {
-                // New content arrived while waiting — advance normally
-                advanceDisplay()
+            if (displayQueue.isNotEmpty()) {
+                // More items waiting — advance
+                showNext()
             }
+            // else: keep current text on screen until silence or new text
         }
-        mainHandler.postDelayed(staleRunnable!!, STALE_LINE_MS)
-    }
-
-    private fun cancelStaleLine() {
-        staleRunnable?.let { mainHandler.removeCallbacks(it) }
-        staleRunnable = null
+        mainHandler.postDelayed(readRunnable!!, READ_MS)
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
 
-    private fun renderLines(animate: Boolean) {
-        val container = linesContainer ?: return
-        container.removeAllViews()
-
-        lines.forEachIndexed { index, text ->
-            val isBottom = index == lines.size - 1
-
-            val tv = TextView(this).apply {
-                this.text = text
-                typeface  = if (isBottom) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, if (isBottom) 21f else 17f)
-                setTextColor(if (isBottom) Color.WHITE else Color.parseColor("#BBFFFFFF"))
-                setShadowLayer(8f, 0f, 2f, Color.BLACK)
-                maxLines  = 2
-                ellipsize = android.text.TextUtils.TruncateAt.END
-
-                if (isBottom) {
-                    background = pillBackground()
-                    setPadding(dp(12), dp(6), dp(12), dp(6))
-                } else {
-                    setPadding(dp(4), dp(2), dp(4), dp(2))
-                }
-            }
-
-            val lp = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = dp(4)
-            }
-            container.addView(tv, lp)
-
-            // Slide-in animation for the newest (bottom) line only
-            if (isBottom && animate) {
-                tv.alpha        = 0f
-                tv.translationY = dp(16).toFloat()
-                tv.animate()
-                    .alpha(1f)
-                    .translationY(0f)
-                    .setDuration(180)
-                    .start()
-            }
+    private fun showText(text: String, animate: Boolean) {
+        val tv = textView ?: return
+        if (animate) {
+            tv.animate().cancel()
+            tv.alpha = 0f
+            tv.text  = text
+            tv.animate()
+                .alpha(1f)
+                .setDuration(200)
+                .start()
+        } else {
+            tv.text  = text
+            tv.alpha = 1f
         }
     }
 
-    private fun clearWithFade(then: () -> Unit) {
-        val container = linesContainer ?: run { then(); return }
-        val count = container.childCount
-        if (count == 0) { then(); return }
-
-        // Fade out all current views, then run callback
-        var finished = 0
-        for (i in 0 until count) {
-            container.getChildAt(i)?.animate()
-                ?.alpha(0f)
-                ?.setDuration(150)
-                ?.withEndAction {
-                    finished++
-                    if (finished == count) {
-                        container.removeAllViews()
-                        then()
-                    }
-                }
-                ?.start()
-        }
+    private fun fadeOut(then: (() -> Unit)? = null) {
+        val tv = textView ?: run { then?.invoke(); return }
+        tv.animate()
+            .alpha(0f)
+            .setDuration(300)
+            .withEndAction {
+                currentText = ""
+                isShowing   = false
+                then?.invoke()
+            }
+            .start()
     }
 
     private fun rescheduleSilence() {
         silenceRunnable?.let { mainHandler.removeCallbacks(it) }
         silenceRunnable = Runnable {
-            cancelStaleLine()
-            clearWithFade {
-                lines.clear()
-                displayQueue.clear()
-                flipScheduled = false
-            }
+            if (!running) return@Runnable
+            readRunnable?.let { mainHandler.removeCallbacks(it) }
+            displayQueue.clear()
+            fadeOut()
         }
         mainHandler.postDelayed(silenceRunnable!!, SILENCE_MS)
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /**
-     * Split Hindi text at sentence boundaries (।!?) so each sentence
-     * gets its own line slot rather than one giant string per update.
-     */
-    private fun splitHindi(text: String): List<String> {
-        val parts = text.split(Regex("(?<=[।!?])|(?<=[.])\\s+"))
-            .map { it.trim() }
-            .filter { it.isNotBlank() }
-        return if (parts.isEmpty()) listOf(text) else parts
-    }
-
-    private fun pillBackground(): android.graphics.drawable.GradientDrawable =
-        android.graphics.drawable.GradientDrawable().apply {
-            shape        = android.graphics.drawable.GradientDrawable.RECTANGLE
-            cornerRadius = dp(8).toFloat()
-            setColor(Color.argb(170, 0, 0, 0))
-        }
 
     // ── Overlay window ────────────────────────────────────────────────────────
 
@@ -290,26 +192,29 @@ class OverlayService : Service() {
         try {
             val sw = resources.displayMetrics.widthPixels
 
-            val outer = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.TRANSPARENT)
-                setPadding(dp(16), dp(8), dp(16), dp(8))
+            // Single TextView — 2 lines max, wraps naturally
+            // No splitting, no containers, no complex logic
+            val tv = TextView(this).apply {
+                typeface  = Typeface.DEFAULT_BOLD
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+                setTextColor(Color.WHITE)
+                setShadowLayer(10f, 0f, 2f, Color.BLACK)
+                maxLines  = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    shape        = android.graphics.drawable.GradientDrawable.RECTANGLE
+                    cornerRadius = dp(10).toFloat()
+                    setColor(Color.argb(180, 0, 0, 0))
+                }
+                setPadding(dp(14), dp(8), dp(14), dp(8))
+                alpha = 0f
+                text  = ""
             }
-
-            linesContainer = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.TRANSPARENT)
-            }
-
-            outer.addView(linesContainer, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-
-            overlayView = outer
+            textView    = tv
+            overlayView = tv
 
             params = WindowManager.LayoutParams(
-                sw,
+                (sw * 0.92).toInt(),
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -319,15 +224,14 @@ class OverlayService : Service() {
                         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT
             ).apply {
-                gravity = Gravity.BOTTOM or Gravity.START
-                x = 0
-                y = dp(80)
+                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                y = dp(90)
             }
 
             // Draggable
             var startRawX = 0f; var startRawY = 0f
             var initX = 0;      var initY = 0
-            outer.setOnTouchListener { _, ev ->
+            tv.setOnTouchListener { _, ev ->
                 val p = params ?: return@setOnTouchListener false
                 when (ev.action) {
                     MotionEvent.ACTION_DOWN -> {
