@@ -423,6 +423,9 @@ class LiveCaptionReader : AccessibilityService() {
         if (l.contains("united states") || l.contains("united kingdom")) return true
         if (l.contains("simplified")    || l.contains("traditional"))    return true
         if (text == "Hide" || text == "Settings" || text == "Feedback")   return true
+        // Live Captions UI labels
+        if (l == "live caption" || l == "live captions") return true
+        if (l.startsWith("live caption") && text.length < 30) return true
         return false
     }
 
