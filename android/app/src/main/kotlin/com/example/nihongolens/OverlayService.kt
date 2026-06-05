@@ -24,8 +24,8 @@ import java.util.concurrent.atomic.AtomicLong
  *  - One readRunnable timer at a time, carries capturedToken for stale-check
  *
  * Timing tuned for beam_size=3 CT2 (5-8s translation):
- *  READ_MS_NORMAL  = 4s  — comfortable reading time per subtitle
- *  READ_MS_BACKLOG = 2s  — catch up when 3+ items queued
+ *  MIN_READ_MS      = 3s  — minimum time each subtitle stays visible
+ *  READ_MS_BACKLOG = 2s  — catch up when backlogged
  *  SILENCE_MS      = 8s  — fade after speech ends
  */
 class OverlayService : Service() {
@@ -55,10 +55,11 @@ class OverlayService : Service() {
     private var currentText = ""
     private var showing     = false
 
-    private val READ_MS_NORMAL  = 4_000L
+    private val MIN_READ_MS     = 3_000L
     private val READ_MS_BACKLOG = 2_000L
     private val SILENCE_MS      = 8_000L
 
+    private var lastDisplayTime  = 0L
     private var readRunnable:    Runnable? = null
     private var silenceRunnable: Runnable? = null
 
@@ -104,12 +105,6 @@ class OverlayService : Service() {
         }
         super.onDestroy()
     }
-
-    private val MIN_READ_MS  = 3_000L   // minimum time each subtitle stays visible
-    private val READ_MS_BACKLOG = 2_000L
-    private val SILENCE_MS   = 8_000L
-
-    private var lastDisplayTime = 0L    // when current subtitle was shown
 
     // ── Queue ─────────────────────────────────────────────────────────────────
 
