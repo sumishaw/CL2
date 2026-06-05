@@ -55,8 +55,8 @@ class OverlayService : Service() {
     private var currentText = ""
     private var showing     = false
 
-    private val MIN_READ_MS     = 3_000L
-    private val READ_MS_BACKLOG = 2_000L
+    private val MIN_READ_MS     = 4_500L   // comfortable reading time — 2 lines of Hindi
+    private val READ_MS_BACKLOG = 2_500L   // catch up pace when backlogged
     private val SILENCE_MS      = 8_000L
 
     private var lastDisplayTime  = 0L
