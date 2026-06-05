@@ -355,6 +355,8 @@ class LiveCaptionReader : AccessibilityService() {
     }
 
     private fun callServer(text: String): String? {
+        // Don't send very short texts — not enough content to translate meaningfully
+        if (text.trim().length < 4) return null
         var conn: HttpURLConnection? = null
         return try {
             conn = URL(TRANSLATE_URL).openConnection() as HttpURLConnection
